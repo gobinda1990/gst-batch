@@ -1,0 +1,271 @@
+package gov.com.ai.webapp.service;
+
+import gov.com.ai.webapp.config.BatchProperties;
+import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
+import java.io.InputStream;
+import java.util.Arrays;
+import java.util.List;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import lombok.extern.slf4j.Slf4j;
+import ml.dmlc.xgboost4j.java.Booster;
+import ml.dmlc.xgboost4j.java.DMatrix;
+import ml.dmlc.xgboost4j.java.XGBoost;
+import org.springframework.core.io.Resource;
+import org.springframework.core.io.ResourceLoader;
+import org.springframework.stereotype.Service;
+
+@Slf4j
+@Service
+public class XgboostRiskScoringService {
+
+    private static final int FEATURE_COUNT = 18;
+    private static final int MAX_BATCH_ROWS = 100_000;
+
+    private final BatchProperties properties;
+    private final ResourceLoader resourceLoader;
+    private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
+    private volatile Booster booster;
+
+    public XgboostRiskScoringService(BatchProperties properties, ResourceLoader resourceLoader) {
+        this.properties = properties;
+        this.resourceLoader = resourceLoader;
+    }
+
+    @PostConstruct
+    public void loadModel() {
+        String modelPath = properties.getModel().getPath();
+        long started = System.nanoTime();
+
+        try {
+            if (modelPath == null || modelPath.isBlank()) {
+                throw new IllegalStateException("XGBoost model path is not configured");
+            }
+
+            Resource resource = resourceLoader.getResource(modelPath);
+            if (!resource.exists()) {
+                throw new IllegalStateException("XGBoost model not found: " + modelPath);
+            }
+            if (!resource.isReadable()) {
+                throw new IllegalStateException("XGBoost model is not readable: " + modelPath);
+            }
+
+            byte[] modelBytes;
+            try (InputStream in = resource.getInputStream()) {
+                modelBytes = in.readAllBytes();
+            }
+
+            if (modelBytes.length == 0) {
+                throw new IllegalStateException("XGBoost model file is empty: " + modelPath);
+            }
+
+            Booster loaded = XGBoost.loadModel(modelBytes);
+            if (loaded == null) {
+                throw new IllegalStateException("XGBoost returned null Booster");
+            }
+
+            smokeTest(loaded);
+
+            lock.writeLock().lock();
+            try {
+                Booster old = booster;
+                booster = loaded;
+                dispose(old);
+            } finally {
+                lock.writeLock().unlock();
+            }
+
+            log.info("XGBoost model loaded successfully: name={}, path={}, bytes={}, features={}, took={} ms",
+                    properties.getModel().getName(),
+                    modelPath,
+                    modelBytes.length,
+                    FEATURE_COUNT,
+                    (System.nanoTime() - started) / 1_000_000);
+        } catch (Exception ex) {
+            log.error("Unable to load XGBoost model. name={}, path={}", properties.getModel().getName(), modelPath, ex);
+            throw new IllegalStateException("Unable to load XGBoost model from " + modelPath, ex);
+        }
+    }
+
+    @PreDestroy
+    public void shutdown() {
+        lock.writeLock().lock();
+        try {
+            dispose(booster);
+            booster = null;
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    public double predict(Gst3bFeatureVector feature) {
+        String error = validationError(feature);
+        if (error != null) {
+            throw new IllegalArgumentException(error);
+        }
+
+        double[] batch = predictBatch(List.of(feature));
+        double score = batch[0];
+        if (Double.isNaN(score)) {
+            throw new IllegalStateException("Invalid XGBoost prediction for row");
+        }
+        return score;
+    }
+
+    public double[] predictBatch(List<Gst3bFeatureVector> features) {
+        if (features == null) {
+            throw new IllegalArgumentException("Feature list must not be null");
+        }
+
+        int total = features.size();
+        if (total == 0) {
+            return new double[0];
+        }
+
+        double[] scores = new double[total];
+        Arrays.fill(scores, Double.NaN);
+
+        lock.readLock().lock();
+        try {
+            Booster model = booster;
+            if (model == null) {
+                throw new IllegalStateException("XGBoost model is not loaded");
+            }
+
+            for (int from = 0; from < total; from += MAX_BATCH_ROWS) {
+                int to = Math.min(total, from + MAX_BATCH_ROWS);
+
+                float[] data = new float[(to - from) * FEATURE_COUNT];
+                int[] origins = new int[to - from];
+                int valid = 0;
+
+                for (int i = from; i < to; i++) {
+                    Gst3bFeatureVector f = features.get(i);
+                    if (f == null) {
+                        continue;
+                    }
+
+                    float[] row = buildFeatureVector(f);
+                    if (invalidFeature(row) != null) {
+                        continue;
+                    }
+
+                    System.arraycopy(row, 0, data, valid * FEATURE_COUNT, FEATURE_COUNT);
+                    origins[valid++] = i;
+                }
+
+                if (valid == 0) {
+                    continue;
+                }
+
+                float[] used = valid * FEATURE_COUNT == data.length ? data : Arrays.copyOf(data, valid * FEATURE_COUNT);
+                float[][] prediction = runPredict(model, used, valid);
+
+                for (int k = 0; k < valid; k++) {
+                    double score = prediction[k][0];
+                    if (!Double.isNaN(score) && !Double.isInfinite(score)) {
+                        scores[origins[k]] = clamp(score);
+                    }
+                }
+            }
+
+            return scores;
+        } catch (RuntimeException ex) {
+            throw ex;
+        } catch (Exception ex) {
+            throw new IllegalStateException("XGBoost prediction failed", ex);
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    public String validationError(Gst3bFeatureVector feature) {
+        if (feature == null) {
+            return "GST 3B feature vector must not be null";
+        }
+        return invalidFeature(buildFeatureVector(feature));
+    }
+
+    private float[][] runPredict(Booster model, float[] data, int rows) throws Exception {
+        DMatrix matrix = null;
+        try {
+            matrix = new DMatrix(data, rows, FEATURE_COUNT, Float.NaN);
+            float[][] prediction = model.predict(matrix);
+
+            if (prediction == null || prediction.length != rows) {
+                throw new IllegalStateException("XGBoost returned " + (prediction == null ? "null" : prediction.length)
+                        + " predictions for " + rows + " rows");
+            }
+
+            for (float[] row : prediction) {
+                if (row == null || row.length == 0) {
+                    throw new IllegalStateException("XGBoost returned an empty prediction row");
+                }
+            }
+
+            return prediction;
+        } finally {
+            if (matrix != null) {
+                matrix.dispose();
+            }
+        }
+    }
+
+    private void smokeTest(Booster candidate) throws Exception {
+        float[][] prediction = runPredict(candidate, new float[FEATURE_COUNT], 1);
+        float value = prediction[0][0];
+        if (Float.isNaN(value) || Float.isInfinite(value)) {
+            throw new IllegalStateException("Model smoke test returned " + value);
+        }
+    }
+
+    private void dispose(Booster b) {
+        if (b == null) {
+            return;
+        }
+        try {
+            b.dispose();
+        } catch (Exception ex) {
+            log.warn("Could not dispose XGBoost booster: {}", ex.toString());
+        }
+    }
+
+    private float[] buildFeatureVector(Gst3bFeatureVector feature) {
+        return new float[] {
+                (float) feature.taxableValue(),
+                (float) feature.totalOutputTax(),
+                (float) feature.eligibleItc(),
+                (float) feature.utilizedItc(),
+                (float) feature.reversedItc(),
+                (float) feature.ineligibleItc(),
+                (float) feature.excessItc(),
+                (float) feature.rcmTotalTax(),
+                (float) feature.cashTaxPaid(),
+                (float) feature.itcPaymentTotal(),
+                (float) feature.itcUtilizationRatio(),
+                (float) feature.cashPaymentRatio(),
+                (float) feature.itcPaymentRatio(),
+                (float) feature.itcToTaxRatio(),
+                (float) feature.nilSupplyRatio(),
+                (float) feature.rcmToTaxRatio(),
+                (float) feature.rcmItcRatio(),
+                (float) feature.rcmCashRatio()
+        };
+    }
+
+    private String invalidFeature(float[] values) {
+        if (values.length != FEATURE_COUNT) {
+            return "Invalid XGBoost feature count. Expected " + FEATURE_COUNT + " but received " + values.length;
+        }
+        for (int i = 0; i < values.length; i++) {
+            if (Float.isInfinite(values[i])) {
+                return "Feature " + (i + 1) + " contains infinite value";
+            }
+        }
+        return null;
+    }
+
+    private double clamp(double value) {
+        return Math.max(0.0, Math.min(1.0, value));
+    }
+}
